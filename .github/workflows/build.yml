@@ -25,7 +25,9 @@ jobs:
 
     - name: Build EXE
       run: |
-        pyinstaller --noconsole --onefile --name "BookManager" book_manager_qt.py
+        pyinstaller --noconsole --onefile --name "BookManager" book_manager_qt_1minn.py
+
+
 
     - name: Upload EXE
       uses: actions/upload-artifact@v4
