@@ -51,6 +51,12 @@ class BookManagerApp(QWidget):
         self.init_ui()
         self.update_status_bar()
 
+        # ★ 실시간 상태 갱신을 위한 타이머 추가 (1초 간격)
+        self.status_timer = QTimer(self)
+        self.status_timer.setInterval(1000)
+        self.status_timer.timeout.connect(self.update_status_bar)
+        self.status_timer.start()
+
     def init_data(self):
         print("[정보] 도서 데이터베이스를 불러오는 중...")
         try:
@@ -152,7 +158,7 @@ class BookManagerApp(QWidget):
             )
 
     def init_ui(self):
-        self.setWindowTitle("📚 도서 관리 시스템 (데모 - 1분 연체)")
+        self.setWindowTitle("📚 도서 관리 시스템")
         self.resize(580, 720)
         self.setStyleSheet("""
             QWidget { background-color: #1a202c; color: #e2e8f0; font-family: 'Apple SD Gothic Neo', '맑은 고딕', sans-serif; }
