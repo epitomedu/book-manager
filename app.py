@@ -1,53 +1,35 @@
 import sys
-import os
-import csv
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pandas as pd
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QPushButton, 
+    QApplication, QWidget, QLabel, QLineEdit, QPushButton,
     QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QTableWidget, QTableWidgetItem, QDialog, QHeaderView, QMessageBox,
     QTabWidget, QFileDialog
 )
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QBrush, QIntValidator
-from supabase import Client, create_client
+from supabase import create_client
 
-# Supabase 설정 정보
+# ==========================================
+# Supabase 설정
+# ==========================================
 SUPABASE_URL = "https://ldpbwvdpltpdjazqviwa.supabase.co"
 SUPABASE_KEY = "sb_publishable_nXwWJyL3ZzBN_nfTuQbieA_NqVkkJ6n"
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-class RealtimeListener(QObject):
-    """Supabase Realtime 변경 사항을 감지하여 UI에 신호를 보내는 워커 클래스"""
-    data_changed = pyqtSignal()
-
-    def __init__(self, client):
-        super().__init__()
-        self.supabase = client
-
-    def run(self):
-        try:
-            def handle_changes(payload):
-                print("[실시간 감지] DB 변경 발생:", payload)
-                self.data_changed.emit()
-
-            # logs 테이블의 변경(INSERT, UPDATE, DELETE)을 실시간 구독
-            self.supabase.channel("public:logs") \
-                .on_postgres_changes(
-                    event="*",
-                    schema="public",
-                    table="logs",
-                    callback=handle_changes
-                ).subscribe()
-        except Exception as e:
-            print(f"[실시간 구독 오류]: {e}")
+# ==========================================
+# 운영 설정
+# ==========================================
+MAX_LOAN = 4
+OVERDUE_DAYS = 7          # 정식 연체 기준 (7일)
+# OVERDUE_DAYS = 0         # 데모용으로 바꾸고 싶을 때 (즉시 연체 테스트)
+POLL_INTERVAL_MS = 5000   # 5초마다 자동 동기화
 
 
 class KoreanLineEdit(QLineEdit):
+    """한글 조합 중복 입력 방지"""
     def __init__(self, placeholder="", parent=None):
         super().__init__(parent)
         self.setPlaceholderText(placeholder)
@@ -73,100 +55,111 @@ class KoreanLineEdit(QLineEdit):
 class LibraryApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.loan_status = {}
-        self.current_book_data = None
-        self.MAX_LOAN = 4
-        self.OVERDUE_MINUTES = 1   # 테스트용 연체 기준 (1분)
+        self.books_cache = {}          # 도서 캐시 (빠름)
+        self.loan_status = {}          # {barcode: {"name": ..., "date": datetime, "title": ...}}
+        self.current_book = None
 
         self.init_ui()
-        self.load_loan_logs_from_supabase()
-        self.update_status_bar()
+        self.full_sync()               # 초기 로드
 
-        # 실시간 상태 갱신을 위한 타이머 (1초 간격)
+        # 5초마다 조용히 자동 동기화
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(self.background_sync)
+        self.poll_timer.start(POLL_INTERVAL_MS)
+
+        # 1초마다 상태바 연체 시간만 갱신
         self.status_timer = QTimer(self)
-        self.status_timer.setInterval(1000)
         self.status_timer.timeout.connect(self.update_status_bar)
-        self.status_timer.start()
+        self.status_timer.start(1000)
 
-        # 방법 2: Supabase Realtime 자동 반영 스레드 시작
-        self.init_realtime_listener()
-
-    def init_realtime_listener(self):
-        self.realtime_thread = QThread(self)
-        self.listener = RealtimeListener(supabase)
-        self.listener.moveToThread(self.realtime_thread)
-        
-        self.realtime_thread.started.connect(self.listener.run)
-        self.listener.data_changed.connect(self.auto_refresh_data)
-        
-        self.realtime_thread.start()
-
-    def auto_refresh_data(self):
-        """다른 컴퓨터에서 변경 사항이 생겼을 때 자동으로 호출되는 새로고침"""
-        print("[자동 동기화] 다른 컴퓨터의 변경 감지, 데이터를 다시 불러옵니다.")
-        self.load_loan_logs_from_supabase()
+    # --------------------------------------------------
+    # 데이터 로드 / 동기화
+    # --------------------------------------------------
+    def full_sync(self):
+        self.load_books_cache()
+        self.rebuild_loan_status()
         self.update_status_bar()
+
+    def background_sync(self):
+        """폴링: 조용히 최신화"""
+        try:
+            self.load_books_cache()
+            self.rebuild_loan_status()
+            self.update_status_bar()
+        except Exception as e:
+            print(f"[폴링 오류] {e}")
 
     def manual_refresh(self):
-        """방법 1: 사용자가 직접 [새로고침] 버튼을 눌렀을 때"""
         self.btn_refresh.setEnabled(False)
         try:
-            self.load_loan_logs_from_supabase()
-            self.update_status_bar()
-            self.lbl_status.setText("[알림] 최신 데이터로 새로고침 되었습니다.")
+            self.full_sync()
+            self.lbl_status.setText(f"[알림] 새로고침 완료 ({datetime.now().strftime('%H:%M:%S')})")
             self.lbl_status.setStyleSheet("color: #63b3ed; font-weight: bold;")
         except Exception as e:
-            print(f"[오류] 수동 새로고침 실패: {e}")
+            self.lbl_status.setText(f"[오류] {e}")
+            self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
         finally:
             self.btn_refresh.setEnabled(True)
 
-    def load_loan_logs_from_supabase(self):
-        print("[정보] Supabase에서 대출 기록을 불러오는 중...")
+    def load_books_cache(self):
         try:
-            response = supabase.table("logs").select("*").execute()
-            rows = response.data
-            
-            self.loan_status.clear()
-            for row in rows:
-                barcode = row.get("barcode")
-                student_name = row.get("student_name")
-                action = row.get("action")
-                created_at_str = row.get("date")
-                
+            res = supabase.table("books").select("*").execute()
+            self.books_cache = {str(item["barcode"]): item for item in (res.data or [])}
+        except Exception as e:
+            print(f"[도서 캐시 오류] {e}")
+
+    def rebuild_loan_status(self):
+        """로그를 시간순으로 재생하여 현재 대출 상태 계산 (최적화)"""
+        try:
+            res = (
+                supabase.table("logs")
+                .select("barcode, action, student_name, date, title")
+                .order("date")
+                .execute()
+            )
+            status = {}
+            for log in (res.data or []):
+                bc = str(log.get("barcode", ""))
+                action = log.get("action")
+                name = log.get("student_name", "")
+                title = log.get("title", "")
+                date_str = log.get("date", "")
+
                 try:
-                    if created_at_str:
-                        loan_date = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00")).replace(tzinfo=None)
-                    else:
-                        loan_date = datetime.now()
+                    loan_date = datetime.fromisoformat(
+                        str(date_str).replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
                 except:
                     loan_date = datetime.now()
 
                 if action == "RENT":
-                    self.loan_status[barcode] = {"name": student_name, "date": loan_date}
-                elif action == "RETURN" and barcode in self.loan_status:
-                    del self.loan_status[barcode]
-            
-            print(f"[성공] 대출 기록 복원 완료 (현재 대출 중인 도서: {len(self.loan_status)}권)")
-        except Exception as e:
-            print(f"[오류] Supabase 로그 로드 실패: {e}")
+                    status[bc] = {"name": name, "date": loan_date, "title": title}
+                elif action == "RETURN" and bc in status:
+                    del status[bc]
 
-    def get_book_info_from_supabase(self, barcode):
-        try:
-            response = supabase.table("books").select("*").eq("barcode", barcode).execute()
-            if response.data and len(response.data) > 0:
-                book = response.data[0]
-                return {
-                    'Barcode': book.get('barcode'),
-                    'Title': book.get('title'),
-                    'Author': book.get('author'),
-                    'AR Level': book.get('ar_level'),
-                    'Lexile': book.get('lexile'),
-                    'Points': book.get('points'),
-                    'AR Quiz No': book.get('ar_quiz_no', '')
-                }
+            self.loan_status = status
         except Exception as e:
-            print(f"[오류] 도서 조회 중 에러: {e}")
-        return None
+            print(f"[대출 상태 계산 오류] {e}")
+
+    # --------------------------------------------------
+    # 유틸
+    # --------------------------------------------------
+    def get_student_id(self):
+        name = self.entry_student.text().strip()
+        phone = self.entry_phone.text().strip()
+        if not name or not phone:
+            return None
+        return f"{name} ({phone})"
+
+    def get_student_loan_count(self, student_id):
+        return sum(1 for v in self.loan_status.values() if v["name"] == student_id)
+
+    def get_overdue_count(self):
+        now = datetime.now()
+        return sum(
+            1 for v in self.loan_status.values()
+            if (now - v["date"]).days > OVERDUE_DAYS
+        )
 
     def force_commit_ime(self):
         focused = QApplication.focusWidget()
@@ -176,253 +169,230 @@ class LibraryApp(QWidget):
             focused.setFocus()
             QApplication.processEvents()
 
-    def get_student_id(self):
-        name = self.entry_student.text().strip()
-        phone = self.entry_phone.text().strip()
-        if not name or not phone:
-            return None
-        return f"{name} ({phone})"
-
-    def get_student_loan_count(self, student_id):
-        return sum(1 for info in self.loan_status.values() if info["name"] == student_id)
-
-    def has_borrowed_before(self, student_id, barcode):
-        try:
-            response = supabase.table("logs").select("*").eq("student_name", student_id).eq("barcode", barcode).eq("action", "RENT").execute()
-            if response.data and len(response.data) > 0:
-                return True
-        except:
-            pass
-        return False
-
-    def get_overdue_count(self):
-        count = 0
-        for info in self.loan_status.values():
-            minutes = (datetime.now() - info["date"]).total_seconds() / 60
-            if minutes > self.OVERDUE_MINUTES:
-                count += 1
-        return count
-
     def update_status_bar(self):
         total = len(self.loan_status)
         overdue = self.get_overdue_count()
-        self.lbl_bottom_status.setText(
-            f"📚 현재 대출 중: {total}권    |    ⚠️ 연체: {overdue}권    |    최대 대출: {self.MAX_LOAN}권/인"
+        self.lbl_bottom.setText(
+            f"📚 대출 중: {total}권   |   ⚠️ 연체: {overdue}권   |   최대 {MAX_LOAN}권/인   |   자동동기화 5초"
         )
         if overdue > 0:
-            self.lbl_bottom_status.setStyleSheet(
-                "background-color: #742a2a; color: #fed7d7; font-weight: bold; font-size: 13px; padding: 10px; border-radius: 6px;"
+            self.lbl_bottom.setStyleSheet(
+                "background:#742a2a; color:#fed7d7; font-weight:bold; font-size:13px; padding:10px; border-radius:6px;"
             )
         else:
-            self.lbl_bottom_status.setStyleSheet(
-                "background-color: #2d3748; color: #a0aec0; font-weight: bold; font-size: 13px; padding: 10px; border-radius: 6px;"
+            self.lbl_bottom.setStyleSheet(
+                "background:#2d3748; color:#a0aec0; font-weight:bold; font-size:13px; padding:10px; border-radius:6px;"
             )
 
+    # --------------------------------------------------
+    # UI
+    # --------------------------------------------------
     def init_ui(self):
         self.setWindowTitle("📚 Epitome Edu Library System")
-        self.resize(580, 760)
+        self.resize(600, 780)
         self.setStyleSheet("""
-            QWidget { background-color: #1a202c; color: #e2e8f0; font-family: 'Apple SD Gothic Neo', '맑은 고딕', sans-serif; }
-            QLineEdit { background-color: #2d3748; color: white; border: 1px solid #4a5568; border-radius: 6px; padding: 8px; font-size: 14px; }
-            QPushButton { background-color: #3182ce; color: white; border-radius: 6px; font-weight: bold; font-size: 13px; padding: 10px; }
-            QPushButton:hover { background-color: #2b6cb0; }
-            QLabel { font-size: 13px; }
-            QTabWidget::pane { border: 1px solid #4a5568; border-radius: 8px; background: #1a202c; }
-            QTabBar::tab { background: #2d3748; color: #a0aec0; padding: 10px 18px; margin-right: 4px; border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; font-size: 13px; }
-            QTabBar::tab:selected { background: #3182ce; color: white; }
-            QGroupBox { border: 1px solid #4a5568; border-radius: 8px; margin-top: 12px; font-weight: bold; color: #90cdf4; padding-top: 10px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
+            QWidget { background:#1a202c; color:#e2e8f0; font-family:'맑은 고딕','Apple SD Gothic Neo',sans-serif; }
+            QLineEdit { background:#2d3748; color:white; border:1px solid #4a5568; border-radius:6px; padding:8px; font-size:14px; }
+            QPushButton { background:#3182ce; color:white; border-radius:6px; font-weight:bold; font-size:13px; padding:10px; }
+            QPushButton:hover { background:#2b6cb0; }
+            QLabel { font-size:13px; }
+            QTabWidget::pane { border:1px solid #4a5568; border-radius:8px; }
+            QTabBar::tab { background:#2d3748; color:#a0aec0; padding:10px 16px; margin-right:4px;
+                           border-top-left-radius:8px; border-top-right-radius:8px; font-weight:bold; }
+            QTabBar::tab:selected { background:#3182ce; color:white; }
+            QGroupBox { border:1px solid #4a5568; border-radius:8px; margin-top:12px; font-weight:bold; color:#90cdf4; padding-top:10px; }
+            QGroupBox::title { subcontrol-origin:margin; left:12px; padding:0 6px; }
         """)
 
-        main_layout = QVBoxLayout()
-        main_layout.setSpacing(12)
-        main_layout.setContentsMargins(14, 14, 14, 14)
+        main = QVBoxLayout(self)
+        main.setSpacing(12)
+        main.setContentsMargins(14, 14, 14, 14)
 
-        # 상단 타이틀 및 수동 [새로고침] 버튼 영역 배치
-        top_control_layout = QHBoxLayout()
-        lbl_app_title = QLabel("📚 라이브러리 관리 시스템")
-        lbl_app_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #63b3ed;")
-        top_control_layout.addWidget(lbl_app_title)
-        
-        top_control_layout.addStretch()
-        
-        # 방법 1: 수동 새로고침 버튼 추가
+        # 상단
+        top = QHBoxLayout()
+        title = QLabel("📚 라이브러리 관리 시스템")
+        title.setStyleSheet("font-size:16px; font-weight:bold; color:#63b3ed;")
+        top.addWidget(title)
+        top.addStretch()
         self.btn_refresh = QPushButton("🔄 새로고침")
-        self.btn_refresh.setStyleSheet("background-color: #319795; font-size: 12px; padding: 6px 12px;")
+        self.btn_refresh.setStyleSheet("background:#319795; font-size:12px; padding:6px 12px;")
         self.btn_refresh.clicked.connect(self.manual_refresh)
-        top_control_layout.addWidget(self.btn_refresh)
-        
-        main_layout.addLayout(top_control_layout)
+        top.addWidget(self.btn_refresh)
+        main.addLayout(top)
 
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
 
-        # 탭 1: 대출/반납
-        tab_loan = QWidget()
-        layout_loan = QVBoxLayout(tab_loan)
-        layout_loan.setSpacing(12)
+        # ===== 탭1: 대출/반납 =====
+        tab1 = QWidget()
+        lay1 = QVBoxLayout(tab1)
+        lay1.setSpacing(12)
 
-        card_bc = QGroupBox("📷 바코드 스캔")
-        vbox_bc = QVBoxLayout()
-        hbox_bc = QHBoxLayout()
+        # 바코드
+        g_bc = QGroupBox("📷 바코드 스캔")
+        v_bc = QVBoxLayout()
+        h_bc = QHBoxLayout()
         self.entry_barcode = KoreanLineEdit("바코드 입력 후 Enter")
         self.entry_barcode.returnPressed.connect(self.on_barcode_enter)
-        hbox_bc.addWidget(self.entry_barcode)
-        btn_bc_ok = QPushButton("확인")
-        btn_bc_ok.clicked.connect(self.safe_search)
-        hbox_bc.addWidget(btn_bc_ok)
-        btn_bc_clear = QPushButton("지우기")
-        btn_bc_clear.setStyleSheet("background-color: #4a5568;")
-        btn_bc_clear.clicked.connect(lambda: self.entry_barcode.clear())
-        hbox_bc.addWidget(btn_bc_clear)
-        vbox_bc.addLayout(hbox_bc)
-        card_bc.setLayout(vbox_bc)
-        layout_loan.addWidget(card_bc)
+        h_bc.addWidget(self.entry_barcode)
+        btn_ok = QPushButton("확인")
+        btn_ok.clicked.connect(self.safe_search)
+        h_bc.addWidget(btn_ok)
+        btn_clr = QPushButton("지우기")
+        btn_clr.setStyleSheet("background:#4a5568;")
+        btn_clr.clicked.connect(lambda: self.entry_barcode.clear())
+        h_bc.addWidget(btn_clr)
+        v_bc.addLayout(h_bc)
+        g_bc.setLayout(v_bc)
+        lay1.addWidget(g_bc)
 
-        card_st = QGroupBox("👤 대여자 정보")
-        vbox_st = QVBoxLayout()
-        hbox_name = QHBoxLayout()
-        hbox_name.addWidget(QLabel("이름:"))
+        # 학생
+        g_st = QGroupBox("👤 대여자 정보")
+        v_st = QVBoxLayout()
+        h_name = QHBoxLayout()
+        h_name.addWidget(QLabel("이름:"))
         self.entry_student = KoreanLineEdit("학생 이름")
         self.entry_student.returnPressed.connect(self.on_student_enter)
-        hbox_name.addWidget(self.entry_student)
-        vbox_st.addLayout(hbox_name)
+        h_name.addWidget(self.entry_student)
+        v_st.addLayout(h_name)
 
-        hbox_phone = QHBoxLayout()
-        hbox_phone.addWidget(QLabel("핸드폰 끝 4자리:"))
+        h_phone = QHBoxLayout()
+        h_phone.addWidget(QLabel("핸드폰 끝 4자리:"))
         self.entry_phone = KoreanLineEdit("1234")
         self.entry_phone.setMaxLength(4)
         self.entry_phone.setValidator(QIntValidator(0, 9999))
         self.entry_phone.returnPressed.connect(self.on_student_enter)
-        hbox_phone.addWidget(self.entry_phone)
-        vbox_st.addLayout(hbox_phone)
+        h_phone.addWidget(self.entry_phone)
+        v_st.addLayout(h_phone)
 
-        hbox_st_btn = QHBoxLayout()
+        h_st_btn = QHBoxLayout()
         btn_st_ok = QPushButton("확인")
         btn_st_ok.clicked.connect(self.safe_check)
-        hbox_st_btn.addWidget(btn_st_ok)
-        btn_st_clear = QPushButton("지우기")
-        btn_st_clear.setStyleSheet("background-color: #4a5568;")
-        btn_st_clear.clicked.connect(self.clear_student_fields)
-        hbox_st_btn.addWidget(btn_st_clear)
-        vbox_st.addLayout(hbox_st_btn)
-        card_st.setLayout(vbox_st)
-        layout_loan.addWidget(card_st)
+        h_st_btn.addWidget(btn_st_ok)
+        btn_st_clr = QPushButton("지우기")
+        btn_st_clr.setStyleSheet("background:#4a5568;")
+        btn_st_clr.clicked.connect(self.clear_student)
+        h_st_btn.addWidget(btn_st_clr)
+        v_st.addLayout(h_st_btn)
+        g_st.setLayout(v_st)
+        lay1.addWidget(g_st)
 
-        card_info = QGroupBox("📖 도서 정보")
+        # 도서 정보
+        g_info = QGroupBox("📖 도서 정보")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
 
-        def add_row(r, text):
+        def row(r, text):
             k = QLabel(text)
-            k.setStyleSheet("color: #a0aec0; font-weight: bold;")
+            k.setStyleSheet("color:#a0aec0; font-weight:bold;")
             v = QLabel("-")
-            v.setStyleSheet("font-weight: bold; font-size: 13px;")
+            v.setStyleSheet("font-weight:bold; font-size:13px;")
             grid.addWidget(k, r, 0)
             grid.addWidget(v, r, 1)
             return v
 
-        self.lbl_title = add_row(0, "제      목 :")
-        self.lbl_title.setStyleSheet("color: #63b3ed; font-weight: bold;")
-        self.lbl_author = add_row(1, "저      자 :")
-        self.lbl_ar = add_row(2, "AR Level :")
-        self.lbl_lexile = add_row(3, "Lexile    :")
-        self.lbl_quiz = add_row(4, "Quiz No  :")
-        self.lbl_barcode = add_row(5, "바 코 드  :")
-        self.lbl_loan = add_row(6, "대출 상태 :")
-        self.lbl_loan.setStyleSheet("color: #48bb78; font-weight: bold;")
-        card_info.setLayout(grid)
-        layout_loan.addWidget(card_info)
+        self.lbl_title = row(0, "제      목 :")
+        self.lbl_title.setStyleSheet("color:#63b3ed; font-weight:bold;")
+        self.lbl_author = row(1, "저      자 :")
+        self.lbl_ar = row(2, "AR Level :")
+        self.lbl_lexile = row(3, "Lexile    :")
+        self.lbl_quiz = row(4, "Quiz No  :")
+        self.lbl_barcode = row(5, "바 코 드  :")
+        self.lbl_loan = row(6, "대출 상태 :")
+        self.lbl_loan.setStyleSheet("color:#48bb78; font-weight:bold;")
+        g_info.setLayout(grid)
+        lay1.addWidget(g_info)
 
-        hbox_btn = QHBoxLayout()
+        # 대출/반납 버튼
+        h_act = QHBoxLayout()
         btn_loan = QPushButton("📥 대출하기")
-        btn_loan.setStyleSheet("background-color: #2b6cb0; font-size: 15px; padding: 12px;")
+        btn_loan.setStyleSheet("background:#2b6cb0; font-size:15px; padding:12px;")
         btn_loan.clicked.connect(lambda: self.safe_process("RENT"))
-        hbox_btn.addWidget(btn_loan)
-
-        btn_return = QPushButton("📤 반납하기")
-        btn_return.setStyleSheet("background-color: #2f855a; font-size: 15px; padding: 12px;")
-        btn_return.clicked.connect(lambda: self.safe_process("RETURN"))
-        hbox_btn.addWidget(btn_return)
-        layout_loan.addLayout(hbox_btn)
+        h_act.addWidget(btn_loan)
+        btn_ret = QPushButton("📤 반납하기")
+        btn_ret.setStyleSheet("background:#2f855a; font-size:15px; padding:12px;")
+        btn_ret.clicked.connect(lambda: self.safe_process("RETURN"))
+        h_act.addWidget(btn_ret)
+        lay1.addLayout(h_act)
 
         self.lbl_status = QLabel("준비됨")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status.setStyleSheet("font-weight: bold; color: #fc8181; font-size: 13px; padding: 6px;")
-        layout_loan.addWidget(self.lbl_status)
+        self.lbl_status.setStyleSheet("font-weight:bold; color:#fc8181; font-size:13px; padding:6px;")
+        lay1.addWidget(self.lbl_status)
+        lay1.addStretch()
+        tabs.addTab(tab1, "📋 대출/반납")
 
-        layout_loan.addStretch()
-        tabs.addTab(tab_loan, "📋 대출/반납")
+        # ===== 탭2: 현황 =====
+        tab2 = QWidget()
+        lay2 = QVBoxLayout(tab2)
+        lay2.setSpacing(14)
 
-        # 탭 2: 현황 조회
-        tab_status = QWidget()
-        layout_status = QVBoxLayout(tab_status)
-        layout_status.setSpacing(14)
+        b1 = QPushButton("📋 전체 대출 현황")
+        b1.setStyleSheet("background:#805ad5; font-size:15px; padding:14px;")
+        b1.clicked.connect(self.show_loan_status)
+        lay2.addWidget(b1)
 
-        btn_status = QPushButton("📋 전체 대출 현황 보기")
-        btn_status.setStyleSheet("background-color: #805ad5; font-size: 15px; padding: 14px;")
-        btn_status.clicked.connect(self.show_loan_status)
-        layout_status.addWidget(btn_status)
+        b2 = QPushButton("⚠️ 연체자 목록")
+        b2.setStyleSheet("background:#e53e3e; font-size:15px; padding:14px;")
+        b2.clicked.connect(self.show_overdue_list)
+        lay2.addWidget(b2)
 
-        btn_overdue = QPushButton("⚠️ 연체자 목록 보기")
-        btn_overdue.setStyleSheet("background-color: #e53e3e; font-size: 15px; padding: 14px;")
-        btn_overdue.clicked.connect(self.show_overdue_list)
-        layout_status.addWidget(btn_overdue)
+        b3 = QPushButton("📊 AR Level별 대여 가능 현황")
+        b3.setStyleSheet("background:#319795; font-size:15px; padding:14px;")
+        b3.clicked.connect(self.show_ar_status)
+        lay2.addWidget(b3)
 
-        btn_ar_status = QPushButton("📊 AR Level별 대여 가능 현황")
-        btn_ar_status.setStyleSheet("background-color: #319795; font-size: 15px; padding: 14px;")
-        btn_ar_status.clicked.connect(self.show_ar_level_status)
-        layout_status.addWidget(btn_ar_status)
+        lay2.addStretch()
+        tabs.addTab(tab2, "📊 현황 조회")
 
-        layout_status.addStretch()
-        tabs.addTab(tab_status, "📊 현황 조회")
+        # ===== 탭3: 도서 관리 =====
+        tab3 = QWidget()
+        lay3 = QVBoxLayout(tab3)
+        lay3.setSpacing(14)
 
-        # 탭 3: 도서 관리
-        tab_manage = QWidget()
-        layout_manage = QVBoxLayout(tab_manage)
-        layout_manage.setSpacing(14)
+        b_add = QPushButton("➕ 새 도서 등록")
+        b_add.setStyleSheet("background:#dd6b20; font-size:15px; padding:14px;")
+        b_add.clicked.connect(self.show_add_book)
+        lay3.addWidget(b_add)
 
-        btn_add_book = QPushButton("➕ 새 도서 등록 (Supabase)")
-        btn_add_book.setStyleSheet("background-color: #dd6b20; font-size: 15px; padding: 14px;")
-        btn_add_book.clicked.connect(self.show_add_book_dialog)
-        layout_manage.addWidget(btn_add_book)
+        b_del = QPushButton("🗑️ 도서 삭제")
+        b_del.setStyleSheet("background:#9b2c2c; font-size:15px; padding:14px;")
+        b_del.clicked.connect(self.show_delete_book)
+        lay3.addWidget(b_del)
 
-        btn_del_book = QPushButton("🗑️ 도서 삭제 (Supabase)")
-        btn_del_book.setStyleSheet("background-color: #9b2c2c; font-size: 15px; padding: 14px;")
-        btn_del_book.clicked.connect(self.show_delete_book_dialog)
-        layout_manage.addWidget(btn_del_book)
+        lay3.addStretch()
+        tabs.addTab(tab3, "📚 도서 관리")
 
-        layout_manage.addStretch()
-        tabs.addTab(tab_manage, "📚 도서 관리")
+        # ===== 탭4: 엑셀 =====
+        tab4 = QWidget()
+        lay4 = QVBoxLayout(tab4)
+        lay4.setSpacing(14)
 
-        # 탭 4: 엑셀 저장
-        tab_excel = QWidget()
-        layout_excel = QVBoxLayout(tab_excel)
-        layout_excel.setSpacing(14)
+        b_ex1 = QPushButton("📊 대출 현황 엑셀 저장")
+        b_ex1.setStyleSheet("background:#2b6cb0; font-size:15px; padding:14px;")
+        b_ex1.clicked.connect(self.export_loan_excel)
+        lay4.addWidget(b_ex1)
 
-        btn_excel_status = QPushButton("📊 대출 현황 엑셀 저장")
-        btn_excel_status.setStyleSheet("background-color: #2b6cb0; font-size: 15px; padding: 14px;")
-        btn_excel_status.clicked.connect(self.export_loan_status_excel)
-        layout_excel.addWidget(btn_excel_status)
+        b_ex2 = QPushButton("📜 전체 로그 엑셀 저장")
+        b_ex2.setStyleSheet("background:#4a5568; font-size:15px; padding:14px;")
+        b_ex2.clicked.connect(self.export_logs_excel)
+        lay4.addWidget(b_ex2)
 
-        btn_excel_log = QPushButton("📜 전체 로그 엑셀 저장")
-        btn_excel_log.setStyleSheet("background-color: #4a5568; font-size: 15px; padding: 14px;")
-        btn_excel_log.clicked.connect(self.export_all_logs_excel)
-        layout_excel.addWidget(btn_excel_log)
+        lay4.addStretch()
+        tabs.addTab(tab4, "📥 엑셀 저장")
 
-        layout_excel.addStretch()
-        tabs.addTab(tab_excel, "📥 엑셀 저장")
+        main.addWidget(tabs)
 
-        main_layout.addWidget(tabs)
+        self.lbl_bottom = QLabel()
+        self.lbl_bottom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main.addWidget(self.lbl_bottom)
 
-        self.lbl_bottom_status = QLabel()
-        self.lbl_bottom_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        main_layout.addWidget(self.lbl_bottom_status)
-
-        self.setLayout(main_layout)
         self.entry_barcode.setFocus()
 
-    def clear_student_fields(self):
+    # --------------------------------------------------
+    # 이벤트 헬퍼
+    # --------------------------------------------------
+    def clear_student(self):
         self.entry_student.clear()
         self.entry_phone.clear()
         self.entry_student.setFocus()
@@ -447,34 +417,42 @@ class LibraryApp(QWidget):
         if not self.entry_student.isComposing() and not self.entry_phone.isComposing():
             self.safe_check()
 
+    # --------------------------------------------------
+    # 핵심 로직
+    # --------------------------------------------------
     def search_book(self):
         code = self.entry_barcode.text().strip()
         if not code:
             return
-        book = self.get_book_info_from_supabase(code)
-        if book:
-            self.current_book_data = book
-            barcode = book.get('Barcode', '')
-            self.lbl_title.setText(book.get('Title', '-'))
-            self.lbl_author.setText(book.get('Author', '-'))
-            self.lbl_ar.setText(str(book.get('AR Level', '-')))
-            self.lbl_lexile.setText(str(book.get('Lexile', '-')))
-            self.lbl_quiz.setText(str(book.get('AR Quiz No', '-')))
-            self.lbl_barcode.setText(barcode)
 
-            if barcode in self.loan_status:
-                info = self.loan_status[barcode]
+        book = self.books_cache.get(code)
+        if not book:
+            # 캐시에 없으면 한 번 더 서버 조회
+            self.load_books_cache()
+            book = self.books_cache.get(code)
+
+        if book:
+            self.current_book = book
+            self.lbl_title.setText(book.get("title", "-"))
+            self.lbl_author.setText(book.get("author", "-"))
+            self.lbl_ar.setText(str(book.get("ar_level", "-")))
+            self.lbl_lexile.setText(str(book.get("lexile", "-")))
+            self.lbl_quiz.setText(str(book.get("ar_quiz_no", "-")))
+            self.lbl_barcode.setText(code)
+
+            if code in self.loan_status:
+                info = self.loan_status[code]
                 self.lbl_loan.setText(f"대출 중 ({info['name']})")
-                self.lbl_loan.setStyleSheet("color: #fc8181; font-weight: bold;")
-                self.lbl_status.setText(f"[주의] 현재 '{info['name']}'님이 대출 중입니다.")
-                self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+                self.lbl_loan.setStyleSheet("color:#fc8181; font-weight:bold;")
+                self.lbl_status.setText(f"[주의] '{info['name']}'님이 대출 중입니다.")
+                self.lbl_status.setStyleSheet("color:#fc8181; font-weight:bold;")
             else:
                 self.lbl_loan.setText("대출 가능")
-                self.lbl_loan.setStyleSheet("color: #48bb78; font-weight: bold;")
-                self.lbl_status.setText("도서 조회 성공. 이름과 핸드폰 끝 4자리를 입력하세요.")
-                self.lbl_status.setStyleSheet("color: #63b3ed; font-weight: bold;")
+                self.lbl_loan.setStyleSheet("color:#48bb78; font-weight:bold;")
+                self.lbl_status.setText("도서 조회 성공. 학생 정보를 입력하세요.")
+                self.lbl_status.setStyleSheet("color:#63b3ed; font-weight:bold;")
         else:
-            self.current_book_data = None
+            self.current_book = None
             self.lbl_title.setText("등록되지 않은 도서입니다.")
             self.lbl_author.setText("-")
             self.lbl_ar.setText("-")
@@ -482,563 +460,487 @@ class LibraryApp(QWidget):
             self.lbl_quiz.setText("-")
             self.lbl_barcode.setText(code)
             self.lbl_loan.setText("-")
-            self.lbl_status.setText("[오류] Supabase에 없는 바코드입니다.")
-            self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+            self.lbl_status.setText("[오류] 등록되지 않은 바코드입니다.")
+            self.lbl_status.setStyleSheet("color:#fc8181; font-weight:bold;")
+
         QTimer.singleShot(50, lambda: self.entry_student.setFocus())
 
     def check_student(self):
-        student_id = self.get_student_id()
-        if not student_id:
+        sid = self.get_student_id()
+        if not sid:
             self.lbl_status.setText("[경고] 이름과 핸드폰 끝 4자리를 모두 입력하세요!")
-            self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+            self.lbl_status.setStyleSheet("color:#fc8181; font-weight:bold;")
             return
 
-        count = self.get_student_loan_count(student_id)
-        overdue_list = []
+        count = self.get_student_loan_count(sid)
         titles = []
+        overdue = []
+        now = datetime.now()
 
-        for b, info in self.loan_status.items():
-            if info["name"] == student_id:
-                book_info = self.get_book_info_from_supabase(b)
-                title = book_info.get('Title', '제목없음') if book_info else f"바코드:{b}"
-                titles.append(title)
-                minutes = (datetime.now() - info["date"]).total_seconds() / 60
-                if minutes > self.OVERDUE_MINUTES:
-                    overdue_list.append(f"{title} ({int(minutes)}분 연체)")
+        for bc, info in self.loan_status.items():
+            if info["name"] == sid:
+                titles.append(info.get("title") or bc)
+                if (now - info["date"]).days > OVERDUE_DAYS:
+                    overdue.append(info.get("title") or bc)
 
-        msg = f"'{student_id}'님 현재 대출: {count}/{self.MAX_LOAN}권"
+        msg = f"'{sid}'님 현재 대출: {count}/{MAX_LOAN}권"
         if titles:
             msg += f"\n도서: {', '.join(titles)}"
-        if overdue_list:
-            msg += f"\n⚠️ 연체 도서: {', '.join(overdue_list)}"
-            self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+        if overdue:
+            msg += f"\n⚠️ 연체: {', '.join(overdue)}"
+            self.lbl_status.setStyleSheet("color:#fc8181; font-weight:bold;")
         else:
-            self.lbl_status.setStyleSheet("color: #48bb78; font-weight: bold;")
-
+            self.lbl_status.setStyleSheet("color:#48bb78; font-weight:bold;")
         self.lbl_status.setText(msg)
 
-    def process_action(self, action_type):
-        if not self.current_book_data:
+    def process_action(self, action):
+        if not self.current_book:
             self.lbl_status.setText("[경고] 먼저 도서를 조회해주세요!")
-            self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+            self.lbl_status.setStyleSheet("color:#fc8181; font-weight:bold;")
             return
 
-        student_id = self.get_student_id()
-        if not student_id:
+        sid = self.get_student_id()
+        if not sid:
             self.lbl_status.setText("[경고] 이름과 핸드폰 끝 4자리를 모두 입력하세요!")
-            self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+            self.lbl_status.setStyleSheet("color:#fc8181; font-weight:bold;")
             return
 
-        barcode = self.current_book_data.get('Barcode', '')
-        title = self.current_book_data.get('Title', '')
-        author = self.current_book_data.get('Author', '')
-        ar_level = str(self.current_book_data.get('AR Level', ''))
+        barcode = str(self.current_book.get("barcode", ""))
+        title = self.current_book.get("title", "")
+        author = self.current_book.get("author", "")
+        ar_level = str(self.current_book.get("ar_level", ""))
 
-        if action_type == "RENT":
-            current_count = self.get_student_loan_count(student_id)
-            if current_count >= self.MAX_LOAN:
-                QMessageBox.warning(self, "대출 제한", f"'{student_id}'님은 이미 {current_count}권을 대출 중입니다.\n최대 {self.MAX_LOAN}권까지 가능합니다.")
+        # 최신 상태 재확인 (동시성)
+        self.rebuild_loan_status()
+
+        if action == "RENT":
+            if self.get_student_loan_count(sid) >= MAX_LOAN:
+                QMessageBox.warning(self, "대출 제한",
+                    f"'{sid}'님은 이미 최대 {MAX_LOAN}권을 대출 중입니다.")
                 return
-
             if barcode in self.loan_status:
-                self.lbl_status.setText(f"[오류] 이미 '{self.loan_status[barcode]['name']}'님이 대출 중!")
-                self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+                holder = self.loan_status[barcode]["name"]
+                QMessageBox.warning(self, "대출 불가", f"이미 '{holder}'님이 대출 중입니다.")
                 return
-
-            if self.has_borrowed_before(student_id, barcode):
-                reply = QMessageBox.information(
-                    self, "이전 대여 안내",
-                    f"'{student_id}'님은 이전에 이 책을 대여한 적이 있습니다.\n그래도 대출하시겠습니까?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if reply == QMessageBox.StandardButton.No:
-                    return
-
-        else: # RETURN
+        else:  # RETURN
             if barcode not in self.loan_status:
-                self.lbl_status.setText("[오류] 대출 기록이 없는 도서입니다!")
-                self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+                QMessageBox.warning(self, "반납 불가", "대출 기록이 없는 도서입니다.")
                 return
-            if self.loan_status[barcode]["name"] != student_id:
-                self.lbl_status.setText(f"[오류] '{self.loan_status[barcode]['name']}'님이 대출한 책입니다!")
-                self.lbl_status.setStyleSheet("color: #fc8181; font-weight: bold;")
+            if self.loan_status[barcode]["name"] != sid:
+                QMessageBox.warning(self, "반납 불가",
+                    f"'{self.loan_status[barcode]['name']}'님이 대출한 책입니다.")
                 return
 
         try:
-            current_time_str = datetime.now().isoformat()
-            log_data = {
-                "date": current_time_str,
+            log = {
+                "date": datetime.now().isoformat(),
                 "barcode": barcode,
-                "student_name": student_id,
-                "action": action_type,
+                "student_name": sid,
+                "action": action,
                 "title": title,
                 "author": author,
-                "ar_level": ar_level
+                "ar_level": ar_level,
             }
-            supabase.table("logs").insert(log_data).execute()
+            supabase.table("logs").insert(log).execute()
 
-            if action_type == "RENT":
-                self.loan_status[barcode] = {"name": student_id, "date": datetime.now()}
-                self.lbl_loan.setText(f"대출 중 ({student_id})")
-                self.lbl_loan.setStyleSheet("color: #fc8181; font-weight: bold;")
-                action_label = "대출"
+            if action == "RENT":
+                self.loan_status[barcode] = {
+                    "name": sid, "date": datetime.now(), "title": title
+                }
+                self.lbl_loan.setText(f"대출 중 ({sid})")
+                self.lbl_loan.setStyleSheet("color:#fc8181; font-weight:bold;")
+                label = "대출"
             else:
                 del self.loan_status[barcode]
                 self.lbl_loan.setText("대출 가능 (반납됨)")
-                self.lbl_loan.setStyleSheet("color: #48bb78; font-weight: bold;")
-                action_label = "반납"
+                self.lbl_loan.setStyleSheet("color:#48bb78; font-weight:bold;")
+                label = "반납"
 
-            self.lbl_status.setText(f"[{title}] 도서 [{action_label}] 완료! ({student_id})")
-            self.lbl_status.setStyleSheet("color: #63b3ed; font-weight: bold;")
-
-            QMessageBox.information(self, "성공", f"[{title}] 도서가 정상적으로 {action_label} 처리되었습니다.\n대여자: {student_id}")
+            self.lbl_status.setText(f"[{title}] {label} 완료! ({sid})")
+            self.lbl_status.setStyleSheet("color:#63b3ed; font-weight:bold;")
+            QMessageBox.information(self, "성공", f"[{title}] {label} 처리 완료\n대여자: {sid}")
 
             self.entry_barcode.clear()
-            self.clear_student_fields()
+            self.clear_student()
             self.entry_barcode.setFocus()
             self.update_status_bar()
 
         except Exception as e:
-            QMessageBox.critical(self, "처리 오류", f"대여/반납 처리 중 오류가 발생했습니다:\n{str(e)}")
+            QMessageBox.critical(self, "오류", f"처리 중 오류:\n{e}")
 
+    # --------------------------------------------------
+    # 현황 팝업
+    # --------------------------------------------------
     def show_loan_status(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"현재 대출 현황 (총 {len(self.loan_status)}권)")
-        dialog.resize(1050, 480)
-        dialog.setStyleSheet("""
-            QDialog { background-color: #1a202c; color: #e2e8f0; }
-            QTableWidget { background-color: #2d3748; color: white; gridline-color: #4a5568; font-size: 13px; }
-            QHeaderView::section { background-color: #4a5568; color: white; font-weight: bold; padding: 6px; }
-            QPushButton { background-color: #3182ce; color: white; border-radius: 4px; font-weight: bold; padding: 6px 10px; }
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"현재 대출 현황 (총 {len(self.loan_status)}권)")
+        dlg.resize(1000, 480)
+        dlg.setStyleSheet("""
+            QDialog { background:#1a202c; color:#e2e8f0; }
+            QTableWidget { background:#2d3748; color:white; gridline-color:#4a5568; font-size:13px; }
+            QHeaderView::section { background:#4a5568; color:white; font-weight:bold; padding:6px; }
+            QPushButton { background:#3182ce; color:white; border-radius:4px; font-weight:bold; padding:8px; }
         """)
-
-        layout = QVBoxLayout()
+        lay = QVBoxLayout(dlg)
         table = QTableWidget()
-        table.setColumnCount(8)
-        table.setHorizontalHeaderLabels(["바코드", "제목", "저자", "AR Level", "대출자", "대출일", "상태", "관리"])
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels(
+            ["바코드", "제목", "저자", "대출자", "대출일", "상태", "관리"]
+        )
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.setSortingEnabled(False)
-        table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
 
-        rows_data = []
-        for barcode, info in list(self.loan_status.items()):
-            book = self.get_book_info_from_supabase(barcode)
-            if book:
-                title = book.get('Title', '')
-                author = book.get('Author', '')
-                ar_level = str(book.get('AR Level', ''))
-            else:
-                title = "(정보 없음)"
-                author = ""
-                ar_level = ""
+        rows = []
+        now = datetime.now()
+        for bc, info in self.loan_status.items():
+            book = self.books_cache.get(bc, {})
+            days = (now - info["date"]).days
+            status = f"{days}일 경과"
+            if days > OVERDUE_DAYS:
+                status = f"⚠️ 연체 {days - OVERDUE_DAYS}일"
+            rows.append([
+                bc,
+                info.get("title") or book.get("title", ""),
+                book.get("author", ""),
+                info["name"],
+                info["date"].strftime("%Y-%m-%d %H:%M"),
+                status,
+            ])
 
-            minutes = (datetime.now() - info["date"]).total_seconds() / 60
-            status = f"{int(minutes)}분 경과"
-            if minutes > self.OVERDUE_MINUTES:
-                status = f"⚠️ 연체 {int(minutes - self.OVERDUE_MINUTES)}분"
-
-            rows_data.append([barcode, title, author, ar_level, info["name"], info["date"].strftime('%Y-%m-%d %H:%M'), status])
-
-        table.setRowCount(len(rows_data))
-        for i, row_data in enumerate(rows_data):
-            for j, value in enumerate(row_data):
-                item = QTableWidgetItem(str(value))
+        table.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            for j, val in enumerate(row):
+                item = QTableWidgetItem(str(val))
                 item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
-                
-                # 셀 내용 가운데 정렬 추가
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                if j == 6 and "연체" in str(value):
+                if j == 5 and "연체" in str(val):
                     item.setForeground(QBrush(QColor("#fc8181")))
                 table.setItem(i, j, item)
 
-            barcode_val = row_data[0]
-            student_val = row_data[4]
-            btn_return_item = QPushButton("반납처리")
-            btn_return_item.setStyleSheet("background-color: #2f855a; font-size: 11px; padding: 4px;")
-            
-            def make_return_handler(b_code, s_name, dlg):
-                return lambda: self.return_from_status_dialog(b_code, s_name, dlg)
+            btn = QPushButton("반납")
+            btn.setStyleSheet("background:#2f855a; font-size:11px; padding:4px;")
+            bc, name = row[0], row[3]
+            btn.clicked.connect(lambda _, b=bc, n=name, d=dlg: self.quick_return(b, n, d))
+            table.setCellWidget(i, 6, btn)
 
-            btn_return_item.clicked.connect(make_return_handler(barcode_val, student_val, dialog))
-            table.setCellWidget(i, 7, btn_return_item)
-
-        layout.addWidget(table)
+        lay.addWidget(table)
         btn_close = QPushButton("닫기")
-        btn_close.clicked.connect(dialog.accept)
-        layout.addWidget(btn_close)
-        dialog.setLayout(layout)
-        dialog.exec()
+        btn_close.clicked.connect(dlg.accept)
+        lay.addWidget(btn_close)
+        dlg.exec()
 
-    def return_from_status_dialog(self, barcode, student_id, dialog):
+    def quick_return(self, barcode, student_id, dialog):
         reply = QMessageBox.question(
             dialog, "반납 확인",
-            f"바코드 [{barcode}] 도서를 반납 처리하시겠습니까?\n대여자: {student_id}",
+            f"바코드 [{barcode}] 반납할까요?\n대여자: {student_id}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if reply == QMessageBox.StandardButton.No:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
-        book_info = self.get_book_info_from_supabase(barcode)
-        title = book_info.get('Title', '') if book_info else ''
-        author = book_info.get('Author', '') if book_info else ''
-        ar_level = str(book_info.get('AR Level', '')) if book_info else ''
-
+        book = self.books_cache.get(barcode, {})
         try:
-            current_time_str = datetime.now().isoformat()
-            log_data = {
-                "date": current_time_str,
+            log = {
+                "date": datetime.now().isoformat(),
                 "barcode": barcode,
                 "student_name": student_id,
                 "action": "RETURN",
-                "title": title,
-                "author": author,
-                "ar_level": ar_level
+                "title": book.get("title", ""),
+                "author": book.get("author", ""),
+                "ar_level": str(book.get("ar_level", "")),
             }
-            supabase.table("logs").insert(log_data).execute()
-
+            supabase.table("logs").insert(log).execute()
             if barcode in self.loan_status:
                 del self.loan_status[barcode]
-
-            QMessageBox.information(dialog, "성공", "정상적으로 반납 처리되었습니다.")
+            QMessageBox.information(dialog, "성공", "반납 완료")
             dialog.accept()
             self.update_status_bar()
         except Exception as e:
-            QMessageBox.critical(dialog, "오류", f"반납 처리 중 오류 발생:\n{str(e)}")
+            QMessageBox.critical(dialog, "오류", str(e))
 
     def show_overdue_list(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("연체자 목록")
-        dialog.resize(950, 450)
-        dialog.setStyleSheet("""
-            QDialog { background-color: #1a202c; color: #e2e8f0; }
-            QTableWidget { background-color: #2d3748; color: white; gridline-color: #4a5568; font-size: 13px; }
-            QHeaderView::section { background-color: #e53e3e; color: white; font-weight: bold; padding: 6px; }
-            QPushButton { background-color: #3182ce; color: white; border-radius: 4px; font-weight: bold; padding: 8px; }
+        dlg = QDialog(self)
+        dlg.setWindowTitle("연체자 목록")
+        dlg.resize(900, 420)
+        dlg.setStyleSheet("""
+            QDialog { background:#1a202c; color:#e2e8f0; }
+            QTableWidget { background:#2d3748; color:white; gridline-color:#4a5568; font-size:13px; }
+            QHeaderView::section { background:#e53e3e; color:white; font-weight:bold; padding:6px; }
+            QPushButton { background:#3182ce; color:white; border-radius:4px; font-weight:bold; padding:8px; }
         """)
+        lay = QVBoxLayout(dlg)
 
-        layout = QVBoxLayout()
-        overdue_items = []
-        for barcode, info in self.loan_status.items():
-            minutes = (datetime.now() - info["date"]).total_seconds() / 60
-            if minutes > self.OVERDUE_MINUTES:
-                overdue_items.append((barcode, info, minutes))
+        items = []
+        now = datetime.now()
+        for bc, info in self.loan_status.items():
+            days = (now - info["date"]).days
+            if days > OVERDUE_DAYS:
+                items.append((bc, info, days))
 
-        if not overdue_items:
+        if not items:
             lbl = QLabel("현재 연체된 도서가 없습니다.")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("font-size: 16px; color: #68d391; padding: 40px;")
-            layout.addWidget(lbl)
-            btn_close = QPushButton("닫기")
-            btn_close.clicked.connect(dialog.accept)
-            layout.addWidget(btn_close)
-            dialog.setLayout(layout)
-            dialog.exec()
-            return
+            lbl.setStyleSheet("font-size:16px; color:#68d391; padding:40px;")
+            lay.addWidget(lbl)
+        else:
+            table = QTableWidget()
+            table.setColumnCount(6)
+            table.setHorizontalHeaderLabels(
+                ["바코드", "제목", "대출자", "대출일", "연체일수", "관리"]
+            )
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            table.setRowCount(len(items))
 
-        table = QTableWidget()
-        table.setColumnCount(7)
-        table.setHorizontalHeaderLabels(["바코드", "제목", "저자", "AR Level", "대출자", "대출일", "연체시간"])
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False)
-
-        table.setRowCount(len(overdue_items))
-        for i, (barcode, info, minutes) in enumerate(overdue_items):
-            book = self.get_book_info_from_supabase(barcode)
-            title = book.get('Title', '') if book else "(정보 없음)"
-            author = book.get('Author', '') if book else ""
-            ar_level = str(book.get('AR Level', '')) if book else ""
-
-            row_data = [
-                barcode, title, author, ar_level,
-                info["name"], info["date"].strftime('%Y-%m-%d %H:%M'),
-                f"{int(minutes - self.OVERDUE_MINUTES)}분 연체"
-            ]
-
-            for j, value in enumerate(row_data):
-                item = QTableWidgetItem(str(value))
-                item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
-                
-                # 셀 내용 가운데 정렬 추가
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                if j == 6:
-                    item.setForeground(QBrush(QColor("#fc8181")))
-                table.setItem(i, j, item)
-
-        layout.addWidget(table)
-        lbl_count = QLabel(f"총 연체 도서: {len(overdue_items)}권")
-        lbl_count.setStyleSheet("font-weight: bold; color: #fc8181; font-size: 14px;")
-        layout.addWidget(lbl_count)
-        btn_close = QPushButton("닫기")
-        btn_close.clicked.connect(dialog.accept)
-        layout.addWidget(btn_close)
-        dialog.setLayout(layout)
-        dialog.exec()
-
-    def show_ar_level_status(self):
-        """AR Level별 대여 가능/현황 조회 팝업 (0.1 단위 세분화 및 가운데 정렬 적용)"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("AR Level별 상세 도서 및 대여 현황")
-        dialog.resize(750, 500)
-        dialog.setStyleSheet("""
-            QDialog { background-color: #1a202c; color: #e2e8f0; }
-            QTableWidget { background-color: #2d3748; color: white; gridline-color: #4a5568; font-size: 13px; }
-            QHeaderView::section { background-color: #319795; color: white; font-weight: bold; padding: 6px; }
-            QPushButton { background-color: #3182ce; color: white; border-radius: 4px; font-weight: bold; padding: 8px; }
-        """)
-
-        layout = QVBoxLayout()
-        table = QTableWidget()
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["AR Level 범위", "총 보유 도서 수", "대출 중", "대출 가능"])
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False)
-
-        try:
-            res = supabase.table("books").select("ar_level, barcode").execute()
-            books = res.data
-            
-            ranges = defaultdict(lambda: {"total": 0, "rented": 0})
-            
-            for b in books:
-                try:
-                    ar = float(b.get('ar_level', 0))
-                except:
-                    ar = 0.0
-                
-                floor_val = int(ar * 10) / 10.0
-                key = f"{floor_val:.1f}"
-                
-                ranges[key]["total"] += 1
-                if b.get('barcode') in self.loan_status:
-                    ranges[key]["rented"] += 1
-
-            sorted_keys = sorted(ranges.keys(), key=lambda x: float(x))
-            table.setRowCount(len(sorted_keys))
-
-            for i, k in enumerate(sorted_keys):
-                total = ranges[k]["total"]
-                rented = ranges[k]["rented"]
-                available = total - rented
-
-                row_vals = [k, f"{total}권", f"{rented}권", f"{available}권"]
-                for j, val in enumerate(row_vals):
-                    item = QTableWidgetItem(val)
+            for i, (bc, info, days) in enumerate(items):
+                vals = [
+                    bc,
+                    info.get("title", ""),
+                    info["name"],
+                    info["date"].strftime("%Y-%m-%d"),
+                    f"{days - OVERDUE_DAYS}일 연체",
+                ]
+                for j, v in enumerate(vals):
+                    item = QTableWidgetItem(str(v))
                     item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
-                    
-                    # 셀 내용 가운데 정렬 추가
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                    if j == 3:
-                        item.setForeground(QBrush(QColor("#68d391" if available > 0 else "#fc8181")))
+                    if j == 4:
+                        item.setForeground(QBrush(QColor("#fc8181")))
                     table.setItem(i, j, item)
 
-        except Exception as e:
-            print(f"[오류] AR 통계 조회 실패: {e}")
+                btn = QPushButton("반납")
+                btn.setStyleSheet("background:#2f855a; font-size:11px; padding:4px;")
+                btn.clicked.connect(
+                    lambda _, b=bc, n=info["name"], d=dlg: self.quick_return(b, n, d)
+                )
+                table.setCellWidget(i, 5, btn)
 
-        layout.addWidget(table)
-        btn_close = QPushButton("닫기")
-        btn_close.clicked.connect(dialog.accept)
-        layout.addWidget(btn_close)
-        dialog.setLayout(layout)
-        dialog.exec()
+            lay.addWidget(table)
+            lbl = QLabel(f"총 연체: {len(items)}권")
+            lbl.setStyleSheet("font-weight:bold; color:#fc8181;")
+            lay.addWidget(lbl)
 
-    def show_add_book_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("새 도서 등록 (Supabase)")
-        dialog.resize(450, 420)
-        dialog.setStyleSheet("""
-            QDialog { background-color: #1a202c; color: #e2e8f0; }
-            QLineEdit { background-color: #2d3748; color: white; border: 1px solid #4a5568; border-radius: 4px; padding: 8px; font-size: 14px; }
-            QLabel { font-size: 13px; font-weight: bold; }
-            QPushButton { background-color: #3182ce; color: white; border-radius: 4px; font-weight: bold; padding: 10px; }
+        btn = QPushButton("닫기")
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn)
+        dlg.exec()
+
+    def show_ar_status(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AR Level별 대여 가능 현황")
+        dlg.resize(500, 500)
+        dlg.setStyleSheet("""
+            QDialog { background:#1a202c; color:#e2e8f0; }
+            QTableWidget { background:#2d3748; color:white; gridline-color:#4a5568; font-size:13px; }
+            QHeaderView::section { background:#319795; color:white; font-weight:bold; padding:6px; }
+            QPushButton { background:#3182ce; color:white; border-radius:4px; font-weight:bold; padding:8px; }
         """)
+        lay = QVBoxLayout(dlg)
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["AR Level", "총 보유", "대출 중", "대출 가능"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
 
-        layout = QVBoxLayout()
-        layout.setSpacing(10)
+        ranges = defaultdict(lambda: {"total": 0, "rented": 0})
+        for bc, book in self.books_cache.items():
+            try:
+                ar = float(book.get("ar_level", 0))
+            except:
+                ar = 0.0
+            key = f"{int(ar * 10) / 10.0:.1f}"
+            ranges[key]["total"] += 1
+            if bc in self.loan_status:
+                ranges[key]["rented"] += 1
 
-        layout.addWidget(QLabel("바코드"))
-        entry_barcode = KoreanLineEdit("바코드 스캔 또는 입력")
-        layout.addWidget(entry_barcode)
+        keys = sorted(ranges.keys(), key=lambda x: float(x))
+        table.setRowCount(len(keys))
+        for i, k in enumerate(keys):
+            total = ranges[k]["total"]
+            rented = ranges[k]["rented"]
+            avail = total - rented
+            for j, val in enumerate([k, f"{total}권", f"{rented}권", f"{avail}권"]):
+                item = QTableWidgetItem(val)
+                item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 3:
+                    item.setForeground(QBrush(QColor("#68d391" if avail > 0 else "#fc8181")))
+                table.setItem(i, j, item)
 
-        layout.addWidget(QLabel("제목"))
-        entry_title = KoreanLineEdit("책 제목")
-        layout.addWidget(entry_title)
+        lay.addWidget(table)
+        btn = QPushButton("닫기")
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn)
+        dlg.exec()
 
-        layout.addWidget(QLabel("저자"))
-        entry_author = KoreanLineEdit("저자 이름")
-        layout.addWidget(entry_author)
+    # --------------------------------------------------
+    # 도서 등록/삭제
+    # --------------------------------------------------
+    def show_add_book(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("새 도서 등록")
+        dlg.resize(420, 400)
+        dlg.setStyleSheet("""
+            QDialog { background:#1a202c; color:#e2e8f0; }
+            QLineEdit { background:#2d3748; color:white; border:1px solid #4a5568; border-radius:4px; padding:8px; }
+            QLabel { font-weight:bold; }
+            QPushButton { background:#3182ce; color:white; border-radius:4px; font-weight:bold; padding:10px; }
+        """)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(8)
 
-        layout.addWidget(QLabel("AR Level (예: 2.3)"))
-        entry_ar = KoreanLineEdit("2.3")
-        layout.addWidget(entry_ar)
+        fields = {}
+        for label, key, ph in [
+            ("바코드", "barcode", "바코드"),
+            ("제목", "title", "책 제목"),
+            ("저자", "author", "저자"),
+            ("AR Level", "ar_level", "2.3"),
+            ("Lexile (선택)", "lexile", "450L"),
+            ("Quiz No (선택)", "ar_quiz_no", ""),
+        ]:
+            lay.addWidget(QLabel(label))
+            e = KoreanLineEdit(ph)
+            fields[key] = e
+            lay.addWidget(e)
 
-        layout.addWidget(QLabel("Lexile (선택)"))
-        entry_lexile = KoreanLineEdit("450L")
-        layout.addWidget(entry_lexile)
-
-        layout.addWidget(QLabel("AR Quiz No (선택)"))
-        entry_quiz = KoreanLineEdit("퀴즈 번호")
-        layout.addWidget(entry_quiz)
-
-        hbox = QHBoxLayout()
+        h = QHBoxLayout()
         btn_save = QPushButton("저장")
         btn_cancel = QPushButton("취소")
-        btn_cancel.setStyleSheet("background-color: #4a5568;")
-        hbox.addWidget(btn_save)
-        hbox.addWidget(btn_cancel)
-        layout.addLayout(hbox)
+        btn_cancel.setStyleSheet("background:#4a5568;")
+        h.addWidget(btn_save)
+        h.addWidget(btn_cancel)
+        lay.addLayout(h)
 
-        dialog.setLayout(layout)
-        entry_barcode.setFocus()
-
-        def save_book():
-            barcode = entry_barcode.text().strip()
-            title = entry_title.text().strip()
-            author = entry_author.text().strip()
-            ar_level = entry_ar.text().strip()
-            lexile = entry_lexile.text().strip()
-            quiz = entry_quiz.text().strip()
-
-            if not barcode or not title or not author or not ar_level:
-                QMessageBox.warning(dialog, "입력 오류", "바코드, 제목, 저자, AR Level은 필수입니다.")
+        def save():
+            barcode = fields["barcode"].text().strip()
+            title = fields["title"].text().strip()
+            author = fields["author"].text().strip()
+            ar = fields["ar_level"].text().strip()
+            if not barcode or not title or not author or not ar:
+                QMessageBox.warning(dlg, "입력 오류", "바코드, 제목, 저자, AR Level은 필수입니다.")
                 return
-
             try:
-                new_data = {
-                    'barcode': barcode,
-                    'title': title,
-                    'author': author,
-                    'ar_level': float(ar_level) if ar_level else 0.0,
-                    'lexile': lexile,
-                    'ar_quiz_no': quiz
+                data = {
+                    "barcode": barcode,
+                    "title": title,
+                    "author": author,
+                    "ar_level": float(ar),
+                    "lexile": fields["lexile"].text().strip(),
+                    "ar_quiz_no": fields["ar_quiz_no"].text().strip(),
                 }
-                supabase.table("books").insert(new_data).execute()
-                QMessageBox.information(dialog, "등록 완료", f"새 도서가 Supabase에 등록되었습니다!\n\n제목: {title}\n바코드: {barcode}")
-                dialog.accept()
+                supabase.table("books").insert(data).execute()
+                self.books_cache[barcode] = data
+                QMessageBox.information(dlg, "완료", f"등록 완료\n{title}")
+                dlg.accept()
             except Exception as e:
-                QMessageBox.critical(dialog, "저장 오류", f"도서 등록 중 오류가 발생했습니다:\n{str(e)}")
+                QMessageBox.critical(dlg, "오류", str(e))
 
-        btn_save.clicked.connect(save_book)
-        btn_cancel.clicked.connect(dialog.reject)
-        dialog.exec()
+        btn_save.clicked.connect(save)
+        btn_cancel.clicked.connect(dlg.reject)
+        fields["barcode"].setFocus()
+        dlg.exec()
 
-    def show_delete_book_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("도서 삭제 (Supabase)")
-        dialog.resize(400, 220)
-        dialog.setStyleSheet("""
-            QDialog { background-color: #1a202c; color: #e2e8f0; }
-            QLineEdit { background-color: #2d3748; color: white; border: 1px solid #4a5568; border-radius: 4px; padding: 8px; font-size: 14px; }
-            QLabel { font-size: 13px; font-weight: bold; }
-            QPushButton { background-color: #9b2c2c; color: white; border-radius: 4px; font-weight: bold; padding: 10px; }
+    def show_delete_book(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("도서 삭제")
+        dlg.resize(400, 200)
+        dlg.setStyleSheet("""
+            QDialog { background:#1a202c; color:#e2e8f0; }
+            QLineEdit { background:#2d3748; color:white; border:1px solid #4a5568; border-radius:4px; padding:8px; }
+            QPushButton { background:#9b2c2c; color:white; border-radius:4px; font-weight:bold; padding:10px; }
         """)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("삭제할 바코드 입력"))
+        entry = KoreanLineEdit("바코드")
+        lay.addWidget(entry)
 
-        layout = QVBoxLayout()
-        layout.setSpacing(10)
-
-        layout.addWidget(QLabel("삭제할 도서 바코드 입력"))
-        entry_barcode = KoreanLineEdit("바코드 스캔 또는 입력")
-        layout.addWidget(entry_barcode)
-
-        hbox = QHBoxLayout()
-        btn_delete = QPushButton("삭제하기")
+        h = QHBoxLayout()
+        btn_del = QPushButton("삭제")
         btn_cancel = QPushButton("취소")
-        btn_cancel.setStyleSheet("background-color: #4a5568;")
-        hbox.addWidget(btn_delete)
-        hbox.addWidget(btn_cancel)
-        layout.addLayout(hbox)
+        btn_cancel.setStyleSheet("background:#4a5568;")
+        h.addWidget(btn_del)
+        h.addWidget(btn_cancel)
+        lay.addLayout(h)
 
-        dialog.setLayout(layout)
-        entry_barcode.setFocus()
-
-        def delete_book():
-            barcode = entry_barcode.text().strip()
-            if not barcode:
-                QMessageBox.warning(dialog, "입력 오류", "바코드를 입력해주세요.")
+        def do_delete():
+            bc = entry.text().strip()
+            if not bc:
                 return
-
-            book = self.get_book_info_from_supabase(barcode)
+            book = self.books_cache.get(bc)
             if not book:
-                QMessageBox.warning(dialog, "오류", f"바코드 [{barcode}]에 해당하는 도서를 찾을 수 없습니다.")
+                QMessageBox.warning(dlg, "오류", "해당 도서를 찾을 수 없습니다.")
                 return
-
-            title = book.get('Title', '')
+            if bc in self.loan_status:
+                QMessageBox.warning(dlg, "삭제 불가", "대출 중인 도서는 삭제할 수 없습니다.")
+                return
             reply = QMessageBox.question(
-                dialog, "삭제 확인",
-                f"정말 다음 도서를 삭제하시겠습니까?\n\n제목: {title}\n바코드: {barcode}",
+                dlg, "확인",
+                f"정말 삭제할까요?\n{book.get('title')} ({bc})",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            if reply == QMessageBox.StandardButton.No:
+            if reply != QMessageBox.StandardButton.Yes:
                 return
-
             try:
-                supabase.table("books").delete().eq("barcode", barcode).execute()
-                QMessageBox.information(dialog, "삭제 완료", f"도서가 성공적으로 삭제되었습니다.\n제목: {title}")
-                dialog.accept()
+                supabase.table("books").delete().eq("barcode", bc).execute()
+                self.books_cache.pop(bc, None)
+                QMessageBox.information(dlg, "완료", "삭제되었습니다.")
+                dlg.accept()
             except Exception as e:
-                QMessageBox.critical(dialog, "삭제 오류", f"도서 삭제 중 오류가 발생했습니다:\n{str(e)}")
+                QMessageBox.critical(dlg, "오류", str(e))
 
-        btn_delete.clicked.connect(delete_book)
-        btn_cancel.clicked.connect(dialog.reject)
-        dialog.exec()
+        btn_del.clicked.connect(do_delete)
+        btn_cancel.clicked.connect(dlg.reject)
+        entry.setFocus()
+        dlg.exec()
 
-    def export_loan_status_excel(self):
-        """현재 대출 현황을 엑셀 파일로 저장"""
+    # --------------------------------------------------
+    # 엑셀
+    # --------------------------------------------------
+    def export_loan_excel(self):
         if not self.loan_status:
-            QMessageBox.information(self, "알림", "현재 대출 중인 도서가 없습니다.")
+            QMessageBox.information(self, "알림", "대출 중인 도서가 없습니다.")
             return
-
-        file_path, _ = QFileDialog.getSaveFileName(self, "대출 현황 엑셀 저장", "loan_status.xlsx", "Excel Files (*.xlsx);;All Files (*)")
-        if not file_path:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "저장", f"대출현황_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            "Excel (*.xlsx)"
+        )
+        if not path:
             return
-
         try:
             data = []
-            for barcode, info in self.loan_status.items():
-                book = self.get_book_info_from_supabase(barcode)
-                title = book.get('Title', '') if book else ''
-                author = book.get('Author', '') if book else ''
-                ar = book.get('AR Level', '') if book else ''
+            for bc, info in self.loan_status.items():
+                book = self.books_cache.get(bc, {})
                 data.append({
-                    "바코드": barcode,
-                    "제목": title,
-                    "저자": author,
-                    "AR Level": ar,
+                    "바코드": bc,
+                    "제목": info.get("title") or book.get("title", ""),
+                    "저자": book.get("author", ""),
+                    "AR Level": book.get("ar_level", ""),
                     "대출자": info["name"],
-                    "대출일시": info["date"].strftime('%Y-%m-%d %H:%M')
+                    "대출일시": info["date"].strftime("%Y-%m-%d %H:%M"),
                 })
-            df = pd.DataFrame(data)
-            df.to_excel(file_path, index=False)
-            QMessageBox.information(self, "성공", f"대출 현황이 성공적으로 저장되었습니다.\n{file_path}")
+            pd.DataFrame(data).to_excel(path, index=False)
+            QMessageBox.information(self, "성공", f"저장 완료\n{path}")
         except Exception as e:
-            QMessageBox.critical(self, "오류", f"엑셀 저장 중 오류 발생:\n{str(e)}")
+            QMessageBox.critical(self, "오류", str(e))
 
-    def export_all_logs_excel(self):
-        """전체 대출/반납 로그를 엑셀 파일로 저장"""
-        file_path, _ = QFileDialog.getSaveFileName(self, "전체 로그 엑셀 저장", "all_logs.xlsx", "Excel Files (*.xlsx);;All Files (*)")
-        if not file_path:
+    def export_logs_excel(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "저장", f"전체로그_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            "Excel (*.xlsx)"
+        )
+        if not path:
             return
-
         try:
-            res = supabase.table("logs").select("*").execute()
-            rows = res.data
-            if not rows:
-                QMessageBox.information(self, "알림", "저장할 로그 데이터가 없습니다.")
+            res = supabase.table("logs").select("*").order("date").execute()
+            if not res.data:
+                QMessageBox.information(self, "알림", "로그가 없습니다.")
                 return
-
-            df = pd.DataFrame(rows)
-            df.to_excel(file_path, index=False)
-            QMessageBox.information(self, "성공", f"전체 로그가 성공적으로 저장되었습니다.\n{file_path}")
+            pd.DataFrame(res.data).to_excel(path, index=False)
+            QMessageBox.information(self, "성공", f"저장 완료\n{path}")
         except Exception as e:
-            QMessageBox.critical(self, "오류", f"엑셀 저장 중 오류 발생:\n{str(e)}")
+            QMessageBox.critical(self, "오류", str(e))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = LibraryApp()
     window.show()
