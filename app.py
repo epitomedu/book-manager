@@ -23,8 +23,8 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # 운영 설정
 # ==========================================
 MAX_LOAN = 4
-OVERDUE_DAYS = 7          # 정식 연체 기준 (7일)
-# OVERDUE_DAYS = 0         # 데모용으로 바꾸고 싶을 때 (즉시 연체 테스트)
+OVERDUE_MINUTES = 1       # ★ 테스트용 연체 기준 (1분)
+# OVERDUE_DAYS = 7        # 정식 운영 시 이걸로 바꾸고 관련 계산도 일 단위로 변경
 POLL_INTERVAL_MS = 5000   # 5초마다 자동 동기화
 
 
@@ -55,33 +55,27 @@ class KoreanLineEdit(QLineEdit):
 class LibraryApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.books_cache = {}          # 도서 캐시 (빠름)
-        self.loan_status = {}          # {barcode: {"name": ..., "date": datetime, "title": ...}}
+        self.books_cache = {}
+        self.loan_status = {}
         self.current_book = None
 
         self.init_ui()
-        self.full_sync()               # 초기 로드
+        self.full_sync()
 
-        # 5초마다 조용히 자동 동기화
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.background_sync)
         self.poll_timer.start(POLL_INTERVAL_MS)
 
-        # 1초마다 상태바 연체 시간만 갱신
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.update_status_bar)
         self.status_timer.start(1000)
 
-    # --------------------------------------------------
-    # 데이터 로드 / 동기화
-    # --------------------------------------------------
     def full_sync(self):
         self.load_books_cache()
         self.rebuild_loan_status()
         self.update_status_bar()
 
     def background_sync(self):
-        """폴링: 조용히 최신화"""
         try:
             self.load_books_cache()
             self.rebuild_loan_status()
@@ -109,7 +103,6 @@ class LibraryApp(QWidget):
             print(f"[도서 캐시 오류] {e}")
 
     def rebuild_loan_status(self):
-        """로그를 시간순으로 재생하여 현재 대출 상태 계산 (최적화)"""
         try:
             res = (
                 supabase.table("logs")
@@ -141,9 +134,6 @@ class LibraryApp(QWidget):
         except Exception as e:
             print(f"[대출 상태 계산 오류] {e}")
 
-    # --------------------------------------------------
-    # 유틸
-    # --------------------------------------------------
     def get_student_id(self):
         name = self.entry_student.text().strip()
         phone = self.entry_phone.text().strip()
@@ -158,7 +148,7 @@ class LibraryApp(QWidget):
         now = datetime.now()
         return sum(
             1 for v in self.loan_status.values()
-            if (now - v["date"]).days > OVERDUE_DAYS
+            if (now - v["date"]).total_seconds() / 60 > OVERDUE_MINUTES
         )
 
     def force_commit_ime(self):
@@ -173,7 +163,7 @@ class LibraryApp(QWidget):
         total = len(self.loan_status)
         overdue = self.get_overdue_count()
         self.lbl_bottom.setText(
-            f"📚 대출 중: {total}권   |   ⚠️ 연체: {overdue}권   |   최대 {MAX_LOAN}권/인   |   자동동기화 5초"
+            f"📚 대출 중: {total}권   |   ⚠️ 연체: {overdue}권   |   최대 {MAX_LOAN}권/인   |   테스트 1분 연체"
         )
         if overdue > 0:
             self.lbl_bottom.setStyleSheet(
@@ -184,11 +174,8 @@ class LibraryApp(QWidget):
                 "background:#2d3748; color:#a0aec0; font-weight:bold; font-size:13px; padding:10px; border-radius:6px;"
             )
 
-    # --------------------------------------------------
-    # UI
-    # --------------------------------------------------
     def init_ui(self):
-        self.setWindowTitle("📚 Epitome Edu Library System")
+        self.setWindowTitle("📚 Epitome Edu Library System (테스트 - 1분 연체)")
         self.resize(600, 780)
         self.setStyleSheet("""
             QWidget { background:#1a202c; color:#e2e8f0; font-family:'맑은 고딕','Apple SD Gothic Neo',sans-serif; }
@@ -208,9 +195,8 @@ class LibraryApp(QWidget):
         main.setSpacing(12)
         main.setContentsMargins(14, 14, 14, 14)
 
-        # 상단
         top = QHBoxLayout()
-        title = QLabel("📚 라이브러리 관리 시스템")
+        title = QLabel("📚 라이브러리 관리 시스템 (테스트 1분 연체)")
         title.setStyleSheet("font-size:16px; font-weight:bold; color:#63b3ed;")
         top.addWidget(title)
         top.addStretch()
@@ -228,7 +214,6 @@ class LibraryApp(QWidget):
         lay1 = QVBoxLayout(tab1)
         lay1.setSpacing(12)
 
-        # 바코드
         g_bc = QGroupBox("📷 바코드 스캔")
         v_bc = QVBoxLayout()
         h_bc = QHBoxLayout()
@@ -246,7 +231,6 @@ class LibraryApp(QWidget):
         g_bc.setLayout(v_bc)
         lay1.addWidget(g_bc)
 
-        # 학생
         g_st = QGroupBox("👤 대여자 정보")
         v_st = QVBoxLayout()
         h_name = QHBoxLayout()
@@ -277,7 +261,6 @@ class LibraryApp(QWidget):
         g_st.setLayout(v_st)
         lay1.addWidget(g_st)
 
-        # 도서 정보
         g_info = QGroupBox("📖 도서 정보")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
@@ -303,7 +286,6 @@ class LibraryApp(QWidget):
         g_info.setLayout(grid)
         lay1.addWidget(g_info)
 
-        # 대출/반납 버튼
         h_act = QHBoxLayout()
         btn_loan = QPushButton("📥 대출하기")
         btn_loan.setStyleSheet("background:#2b6cb0; font-size:15px; padding:12px;")
@@ -389,9 +371,6 @@ class LibraryApp(QWidget):
 
         self.entry_barcode.setFocus()
 
-    # --------------------------------------------------
-    # 이벤트 헬퍼
-    # --------------------------------------------------
     def clear_student(self):
         self.entry_student.clear()
         self.entry_phone.clear()
@@ -417,9 +396,6 @@ class LibraryApp(QWidget):
         if not self.entry_student.isComposing() and not self.entry_phone.isComposing():
             self.safe_check()
 
-    # --------------------------------------------------
-    # 핵심 로직
-    # --------------------------------------------------
     def search_book(self):
         code = self.entry_barcode.text().strip()
         if not code:
@@ -427,7 +403,6 @@ class LibraryApp(QWidget):
 
         book = self.books_cache.get(code)
         if not book:
-            # 캐시에 없으면 한 번 더 서버 조회
             self.load_books_cache()
             book = self.books_cache.get(code)
 
@@ -480,8 +455,9 @@ class LibraryApp(QWidget):
         for bc, info in self.loan_status.items():
             if info["name"] == sid:
                 titles.append(info.get("title") or bc)
-                if (now - info["date"]).days > OVERDUE_DAYS:
-                    overdue.append(info.get("title") or bc)
+                minutes = (now - info["date"]).total_seconds() / 60
+                if minutes > OVERDUE_MINUTES:
+                    overdue.append(f"{info.get('title') or bc} ({int(minutes)}분)")
 
         msg = f"'{sid}'님 현재 대출: {count}/{MAX_LOAN}권"
         if titles:
@@ -510,7 +486,6 @@ class LibraryApp(QWidget):
         author = self.current_book.get("author", "")
         ar_level = str(self.current_book.get("ar_level", ""))
 
-        # 최신 상태 재확인 (동시성)
         self.rebuild_loan_status()
 
         if action == "RENT":
@@ -522,7 +497,7 @@ class LibraryApp(QWidget):
                 holder = self.loan_status[barcode]["name"]
                 QMessageBox.warning(self, "대출 불가", f"이미 '{holder}'님이 대출 중입니다.")
                 return
-        else:  # RETURN
+        else:
             if barcode not in self.loan_status:
                 QMessageBox.warning(self, "반납 불가", "대출 기록이 없는 도서입니다.")
                 return
@@ -568,9 +543,6 @@ class LibraryApp(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "오류", f"처리 중 오류:\n{e}")
 
-    # --------------------------------------------------
-    # 현황 팝업
-    # --------------------------------------------------
     def show_loan_status(self):
         dlg = QDialog(self)
         dlg.setWindowTitle(f"현재 대출 현황 (총 {len(self.loan_status)}권)")
@@ -594,10 +566,10 @@ class LibraryApp(QWidget):
         now = datetime.now()
         for bc, info in self.loan_status.items():
             book = self.books_cache.get(bc, {})
-            days = (now - info["date"]).days
-            status = f"{days}일 경과"
-            if days > OVERDUE_DAYS:
-                status = f"⚠️ 연체 {days - OVERDUE_DAYS}일"
+            minutes = (now - info["date"]).total_seconds() / 60
+            status = f"{int(minutes)}분 경과"
+            if minutes > OVERDUE_MINUTES:
+                status = f"⚠️ 연체 {int(minutes - OVERDUE_MINUTES)}분"
             rows.append([
                 bc,
                 info.get("title") or book.get("title", ""),
@@ -673,9 +645,9 @@ class LibraryApp(QWidget):
         items = []
         now = datetime.now()
         for bc, info in self.loan_status.items():
-            days = (now - info["date"]).days
-            if days > OVERDUE_DAYS:
-                items.append((bc, info, days))
+            minutes = (now - info["date"]).total_seconds() / 60
+            if minutes > OVERDUE_MINUTES:
+                items.append((bc, info, minutes))
 
         if not items:
             lbl = QLabel("현재 연체된 도서가 없습니다.")
@@ -686,18 +658,18 @@ class LibraryApp(QWidget):
             table = QTableWidget()
             table.setColumnCount(6)
             table.setHorizontalHeaderLabels(
-                ["바코드", "제목", "대출자", "대출일", "연체일수", "관리"]
+                ["바코드", "제목", "대출자", "대출일", "연체시간", "관리"]
             )
             table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
             table.setRowCount(len(items))
 
-            for i, (bc, info, days) in enumerate(items):
+            for i, (bc, info, minutes) in enumerate(items):
                 vals = [
                     bc,
                     info.get("title", ""),
                     info["name"],
-                    info["date"].strftime("%Y-%m-%d"),
-                    f"{days - OVERDUE_DAYS}일 연체",
+                    info["date"].strftime("%Y-%m-%d %H:%M"),
+                    f"{int(minutes - OVERDUE_MINUTES)}분 연체",
                 ]
                 for j, v in enumerate(vals):
                     item = QTableWidgetItem(str(v))
@@ -772,9 +744,6 @@ class LibraryApp(QWidget):
         lay.addWidget(btn)
         dlg.exec()
 
-    # --------------------------------------------------
-    # 도서 등록/삭제
-    # --------------------------------------------------
     def show_add_book(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("새 도서 등록")
@@ -892,9 +861,6 @@ class LibraryApp(QWidget):
         entry.setFocus()
         dlg.exec()
 
-    # --------------------------------------------------
-    # 엑셀
-    # --------------------------------------------------
     def export_loan_excel(self):
         if not self.loan_status:
             QMessageBox.information(self, "알림", "대출 중인 도서가 없습니다.")
