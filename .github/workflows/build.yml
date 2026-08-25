@@ -3,7 +3,7 @@ name: Build Windows EXE
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch:   # 수동으로도 실행 가능
 
 jobs:
   build:
@@ -21,11 +21,15 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install PyQt6 pandas openpyxl pyinstaller supabase
+        pip install PyQt6 pandas openpyxl python-dotenv supabase pyinstaller
 
     - name: Build EXE
       run: |
-        pyinstaller --noconsole --onefile --name "BookManager" app.py
+        pyinstaller --noconsole --onefile --name "BookManager" ^
+          --hidden-import=config ^
+          --hidden-import=db ^
+          --hidden-import=utils ^
+          app.py
 
     - name: Upload EXE
       uses: actions/upload-artifact@v4
