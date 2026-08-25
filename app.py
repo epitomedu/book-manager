@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QDialog, QHeaderView, QMessageBox,
     QTabWidget, QFileDialog
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QColor, QBrush, QIntValidator
 from supabase import Client, create_client
 
@@ -19,6 +19,32 @@ SUPABASE_URL = "https://ldpbwvdpltpdjazqviwa.supabase.co"
 SUPABASE_KEY = "sb_publishable_nXwWJyL3ZzBN_nfTuQbieA_NqVkkJ6n"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+class RealtimeListener(QObject):
+    """Supabase Realtime 변경 사항을 감지하여 UI에 신호를 보내는 워커 클래스"""
+    data_changed = pyqtSignal()
+
+    def __init__(self, client):
+        super().__init__()
+        self.supabase = client
+
+    def run(self):
+        try:
+            def handle_changes(payload):
+                print("[실시간 감지] DB 변경 발생:", payload)
+                self.data_changed.emit()
+
+            # logs 테이블의 변경(INSERT, UPDATE, DELETE)을 실시간 구독
+            self.supabase.channel("public:logs") \
+                .on_postgres_changes(
+                    event="*",
+                    schema="public",
+                    table="logs",
+                    callback=handle_changes
+                ).subscribe()
+        except Exception as e:
+            print(f"[실시간 구독 오류]: {e}")
 
 
 class KoreanLineEdit(QLineEdit):
@@ -61,6 +87,38 @@ class LibraryApp(QWidget):
         self.status_timer.setInterval(1000)
         self.status_timer.timeout.connect(self.update_status_bar)
         self.status_timer.start()
+
+        # 방법 2: Supabase Realtime 자동 반영 스레드 시작
+        self.init_realtime_listener()
+
+    def init_realtime_listener(self):
+        self.realtime_thread = QThread(self)
+        self.listener = RealtimeListener(supabase)
+        self.listener.moveToThread(self.realtime_thread)
+        
+        self.realtime_thread.started.connect(self.listener.run)
+        self.listener.data_changed.connect(self.auto_refresh_data)
+        
+        self.realtime_thread.start()
+
+    def auto_refresh_data(self):
+        """다른 컴퓨터에서 변경 사항이 생겼을 때 자동으로 호출되는 새로고침"""
+        print("[자동 동기화] 다른 컴퓨터의 변경 감지, 데이터를 다시 불러옵니다.")
+        self.load_loan_logs_from_supabase()
+        self.update_status_bar()
+
+    def manual_refresh(self):
+        """방법 1: 사용자가 직접 [새로고침] 버튼을 눌렀을 때"""
+        self.btn_refresh.setEnabled(False)
+        try:
+            self.load_loan_logs_from_supabase()
+            self.update_status_bar()
+            self.lbl_status.setText("[알림] 최신 데이터로 새로고침 되었습니다.")
+            self.lbl_status.setStyleSheet("color: #63b3ed; font-weight: bold;")
+        except Exception as e:
+            print(f"[오류] 수동 새로고침 실패: {e}")
+        finally:
+            self.btn_refresh.setEnabled(True)
 
     def load_loan_logs_from_supabase(self):
         print("[정보] Supabase에서 대출 기록을 불러오는 중...")
@@ -162,7 +220,7 @@ class LibraryApp(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("📚 Epitome Edu Library System")
-        self.resize(580, 720)
+        self.resize(580, 760)
         self.setStyleSheet("""
             QWidget { background-color: #1a202c; color: #e2e8f0; font-family: 'Apple SD Gothic Neo', '맑은 고딕', sans-serif; }
             QLineEdit { background-color: #2d3748; color: white; border: 1px solid #4a5568; border-radius: 6px; padding: 8px; font-size: 14px; }
@@ -179,6 +237,22 @@ class LibraryApp(QWidget):
         main_layout = QVBoxLayout()
         main_layout.setSpacing(12)
         main_layout.setContentsMargins(14, 14, 14, 14)
+
+        # 상단 타이틀 및 수동 [새로고침] 버튼 영역 배치
+        top_control_layout = QHBoxLayout()
+        lbl_app_title = QLabel("📚 라이브러리 관리 시스템")
+        lbl_app_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #63b3ed;")
+        top_control_layout.addWidget(lbl_app_title)
+        
+        top_control_layout.addStretch()
+        
+        # 방법 1: 수동 새로고침 버튼 추가
+        self.btn_refresh = QPushButton("🔄 새로고침")
+        self.btn_refresh.setStyleSheet("background-color: #319795; font-size: 12px; padding: 6px 12px;")
+        self.btn_refresh.clicked.connect(self.manual_refresh)
+        top_control_layout.addWidget(self.btn_refresh)
+        
+        main_layout.addLayout(top_control_layout)
 
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
@@ -728,7 +802,6 @@ class LibraryApp(QWidget):
             res = supabase.table("books").select("ar_level, barcode").execute()
             books = res.data
             
-            # 0.1 단위별로 딱 떨어지게 그룹화 (예: 1.0, 1.1, 1.2 ...)
             ranges = defaultdict(lambda: {"total": 0, "rented": 0})
             
             for b in books:
