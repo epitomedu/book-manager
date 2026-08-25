@@ -23,16 +23,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install PyQt6 pandas openpyxl python-dotenv supabase pyinstaller
 
-    - name: Build macOS App
+    - name: Build macOS .app
       run: |
-        pyinstaller --windowed --onefile --name "BookManager" \
-          --hidden-import=config \
-          --hidden-import=db \
-          --hidden-import=utils \
-          app.py
+        pyinstaller --windowed --name "BookManager" --icon=icon.icns --hidden-import=config --hidden-import=db --hidden-import=utils app.py
 
-    - name: Upload App
+    - name: Upload .app
       uses: actions/upload-artifact@v4
       with:
         name: BookManager-macOS
-        path: dist/BookManager
+        path: dist/BookManager.app
